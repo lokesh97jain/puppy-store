@@ -186,7 +186,12 @@ const SIMULATE_EMPTY = true;  // Change to true
 - Data: `data/puppies.json` (30 puppies)
 
 ---
+### Documents
+- [Backend](./backend_api_design.md)
+- [LLM Integration](./llm_integration.md)
+- [DevOps and Infrastructure](./devops_infrastructure.md)
 
+---
 ## UI Preview
 
 Screenshots below show the list and detail screens for reference only.
