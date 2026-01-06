@@ -1,0 +1,381 @@
+﻿# Backend & API Design
+
+## 1. Data Storage Strategy
+
+### Initial / Small-Scale Setup
+For an early-stage or low-traffic application:
+- Use a simple relational database (e.g., PostgreSQL or SQLite)
+- Store puppy metadata (name, description, age, location)
+- Store image files in a simple file store or object storage
+- Keep schema minimal to optimize for development speed
+
+This setup is inexpensive, easy to maintain, and sufficient for small datasets.
+
+### Scalable / Growth-Oriented Setup
+As data volume and traffic increase:
+- Move to managed services on a cloud provider (e.g., Google Cloud Platform):
+  - **Cloud SQL (Postgres)** for relational data
+  - **Cloud Storage (GCS)** for images
+  - **Cloud CDN** in front of storage for fast global image delivery
+  - **Cloud Run** for the API (autoscaling, pay-per-use)
+
+This separation ensures:
+- Database remains lightweight
+- Images are served efficiently
+- Backend scales automatically with demand
+
+---
+
+## 2. Image Storage Design ðŸ“¸
+
+### Key Principle
+Images should **not** be stored directly in the database. Only image metadata and URLs are stored in the DB; actual image files live in object storage.
+
+### Handling Multiple Photos per Puppy
+Instead of embedding image fields in the puppy record, use a separate photo table.
+
+#### Example Schema
+
+**puppies table:**
+- `id` (primary key)
+- `name`
+- `description`
+- `ageMonths`
+- `location`
+- `createdAt`
+- `updatedAt`
+
+**puppy_photos table:**
+- `id` (primary key)
+- `puppyId` (foreign key â†’ puppies.id)
+- `storageKey` (e.g., `puppies/p_123/photo_1.jpg`)
+- `publicUrl`
+- `sortOrder`
+- `isPrimary`
+- `createdAt`
+
+#### Database Indexes (PostgreSQL)
+
+```sql
+-- Pagination index
+CREATE INDEX idx_puppies_created_id ON puppies(createdAt DESC, id DESC);
+
+-- Location filtering (future feature)
+CREATE INDEX idx_puppies_location ON puppies(location);
+
+```
+
+**This design:**
+- Supports any number of photos per puppy
+- Keeps the main puppy record small
+- Allows easy reordering and primary-image selection
+
+---
+
+## 3. API Design
+
+### API Style
+**REST API** is used for simplicity, debuggability, and mobile-friendliness. The API acts as a Backend-for-Frontend for the mobile app.
+
+### API Versioning
+- URL-based versioning: `/v1/puppies`
+- Maintain backward compatibility for 6 months
+- Deprecation notices via response headers:
+  ```
+  X-API-Deprecation: "This endpoint will be deprecated on 2026-06-01"
+  X-API-Sunset: "2026-06-01"
+  ```
+- Mobile app checks minimum supported version on startup
+
+### Core Endpoints
+
+#### List Puppies (Paginated)
+```
+GET /v1/puppies?limit=20&cursor=<opaqueCursor>
+```
+
+**Response:**
+```json
+{
+  "items": [
+    {
+      "id": "p_123",
+      "name": "Milo",
+      "description": "Friendly and calm.",
+      "primaryPhotoUrl": "https://cdn.example.com/puppies/p_123/main.jpg",
+      "photoCount": 5,
+      "ageMonths": 18,
+      "location": "Austin, TX"
+    }
+  ],
+  "nextCursor": "eyJjcmVhdGVkQXQiOiIyMDI2LTAxLTA0VDEwOjMwOjAwWiIsImlkIjoicF8xMjMifQ==",
+  "hasMore": true
+}
+```
+
+Only the **primary photo** is returned for list views to keep payloads small and fast.
+
+#### Puppy Detail
+```
+GET /v1/puppies/:id
+```
+
+**Response:**
+```json
+{
+  "id": "p_123",
+  "name": "Milo",
+  "description": "Friendly and calm.",
+  "ageMonths": 18,
+  "location": "Austin, TX",
+  "photos": [
+    { "id": "ph_1", "url": "https://cdn.example.com/...", "sortOrder": 0, "isPrimary": true },
+    { "id": "ph_2", "url": "https://cdn.example.com/...", "sortOrder": 1, "isPrimary": false }
+  ]
+}
+``` 
+
+**REST API** is used for simplicity, debuggability, and mobile-friendliness. **GraphQL** would be considered if the data model became more complex with many interrelated entities requiring flexible client-side querying. 
+
+---
+
+## 4. Pagination Strategy
+
+### Cursor-Based Pagination
+
+**Implementation:**
+- **Sort by:** `createdAt DESC, id DESC` (stable, indexed)
+- **Cursor format:** Base64-encoded JSON: `{"createdAt": "2026-01-04T10:30:00Z", "id": "p_123"}`
+- **Query logic:**
+  ```sql
+  WHERE (createdAt < cursor.createdAt) 
+     OR (createdAt = cursor.createdAt AND id < cursor.id)
+  ORDER BY createdAt DESC, id DESC
+  LIMIT 21  -- Fetch 21, return 20, use 21st to determine hasMore
+  ```
+
+**Benefits:**
+- No `OFFSET` (O(1) vs O(n) performance)
+- Immune to real-time inserts/deletes
+- Works with any sort order
+- Prevents duplicates and skips when data changes
+- Scales efficiently with indexed queries
+
+**Why not offset-based pagination?**
+- `OFFSET` becomes slow for large datasets (must scan skipped rows)
+- New inserts can cause duplicate or missing results
+
+---
+
+## 5. Image Upload Flow
+
+### Simple Approach (Small App)
+- Admin uploads images via multipart form
+- Backend stores image and saves metadata
+
+### Scalable Approach
+1. Backend issues a **signed upload URL**
+2. uploads **directly to object storage** (GCS)
+3. Backend records metadata after successful upload
+4. Generate image variants (thumbnail, medium, large) asynchronously
+
+**Benefits:**
+- Reduces backend load
+- Lowers cost (no proxy traffic)
+- Improves upload reliability
+
+**Image Optimization:**
+- Generate variants on upload: 
+  - Thumbnail: 200Ã—200 (for list views)
+  - Medium: 800Ã—800 (for detail views)
+  - Large: 1600Ã—1600 (for full-screen) 
+
+---
+
+## 6. Caching & Performance âš¡
+
+### Multi-Layer Caching
+
+#### 1. CDN (CloudFlare/Cloud CDN)
+```
+Images: Cache-Control: public, max-age=31536000, immutable
+```
+Use content-addressed filenames (e.g., `image_a1b2c3.jpg`)
+
+#### 2. HTTP Caching (API Responses)
+```
+GET /puppies: Cache-Control: public, max-age=60, stale-while-revalidate=300
+GET /puppies/:id: Cache-Control: public, max-age=300
+```
+Use ETags for conditional requests (304 Not Modified)
+
+#### 3. Server-Side Cache (Redis)
+- First page of `/puppies`: 60-second TTL
+- Popular puppy details: 5-minute TTL
+- Cache key format: `"puppies:list:cursor:null:limit:20"`
+
+#### 4. Mobile App Cache
+- React Query with 5-minute stale time
+- Background refetch on focus
+- Optimistic updates for user actions
+
+---
+
+## 7. Error Handling ðŸ§¯
+
+### Client-Side Error Strategy
+- Show user-friendly message, don't retry
+- Exponential backoff retry (1s, 2s, 4s, 8s, max 3 attempts)
+- **Network errors:** Show offline indicator, queue for retry 
+
+### Server Response Format
+```json
+{
+  "error": {
+    "code": "PUPPY_NOT_FOUND",
+    "message": "Puppy not found",
+    "details": { "puppyId": "p_123" }
+  },
+  "requestId": "req_abc123",
+  "timestamp": "2026-01-04T10:30:00Z"
+}
+```
+
+### Status Codes
+- `200` - Success
+- `400` - Invalid input (e.g., invalid cursor)
+- `404` - Puppy not found
+- `429` - Rate limited (+ `Retry-After` header)
+- `500` - Server error
+- `503` - Service temporarily unavailable (maintenance)
+
+---
+
+## 8. Rate Limiting ðŸš¦
+
+### Public Endpoints
+- `/puppies` (list): 100 requests/minute per IP
+- `/puppies/:id` (detail): 200 requests/minute per IP
+
+### Implementation
+- Use Redis with **sliding window algorithm**
+- Return `429` with `Retry-After` header
+- Whitelist authenticated users for higher limits
+
+### Response Headers
+```
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 87
+X-RateLimit-Reset: 1704362400
+```
+
+---
+
+## 9. Authentication Considerations ðŸ”
+
+### Auth Strategy
+- **Public browsing:** No auth required
+- **User actions** (favorites, reservations): JWT required
+- **Admin operations:** JWT + role check
+
+### JWT Implementation
+- **Access token:** 15-minute expiry (stored in memory)
+- **Refresh token:** 7-day expiry (stored in Keychain/Keystore)
+- **Token refresh flow:**
+  ```
+  POST /auth/refresh
+  { "refreshToken": "..." }
+  â†’ Returns new access token
+  ```
+
+### Endpoints
+- `POST /auth/login` â†’ Returns access + refresh tokens
+- `POST /auth/refresh` â†’ Returns new access token
+- `POST /auth/logout` â†’ Invalidates refresh token
+
+---
+
+## 10. Cost Considerations ðŸ’°
+
+### Optimization Strategies
+- Aggressive CDN caching reduces origin requests by 90%
+- Image compression reduces storage costs by 60%
+- Serverless compute scales to zero during low traffic
+- Read replicas for analytics queries (don't hit primary DB)
+
+---
+
+## 11. Monitoring & Observability ðŸ“Š
+
+### Metrics to Track
+- **API latency** 
+- **Error rates** 
+- **Database performance:** query duration, connection pool usage
+- **CDN hit rate:** % of requests served from cache 
+
+### Logging Strategy
+- Structured JSON logs (timestamp, level, requestId, userId, endpoint)
+- Log levels: DEBUG (dev), INFO (prod), WARN, ERROR
+- **Never log sensitive data** (tokens, personal info)
+
+### Tools
+- **Application:** Google Cloud Logging / DataDog
+- **Database:** Cloud SQL Insights for slow queries
+- **APM:** Google Cloud Trace for request tracing
+- **Alerts:** PagerDuty for critical errors 
+
+### Health Checks
+- `GET /health` â†’ 200 OK (simple liveness check)
+- `GET /health/ready` â†’ Checks DB connection, returns 200 or 503
+
+---
+
+## 12. High-Level Architecture Diagram
+
+### Early Stage
+```
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚ React App   â”‚
+â””â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”˜
+       â”‚ HTTPS
+       â†“
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  REST API   â”‚â”€â”€â”€â”€â”€â†’â”‚   DB     â”‚      â”‚ Image Storage â”‚
+â”‚             â”‚      â”‚ (SQLite) â”‚      â”‚ (Local)       â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜      â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜      
+```
+
+### Scalable Setup (GCP)
+```
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  React App  â”‚
+â””â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”˜
+       â”‚ HTTPS
+       â†“
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  Cloud CDN   â”‚ (Images cached globally)
+â””â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”˜
+       â†“
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  Cloud Run   â”‚â”€â”€â”€â”€â”€â†’â”‚  Cloud SQL â”‚      â”‚   Cloud     â”‚
+â”‚  (REST API)  â”‚      â”‚ (Postgres) â”‚      â”‚  Storage    â”‚
+â”‚  Autoscaling â”‚      â”‚  Primary + â”‚      â”‚  (Images)   â”‚
+â””â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”˜      â”‚  Replicas  â”‚      â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+       â”‚              â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+       â†“
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚    Redis     â”‚ (Hot data cache)
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+```
+
+### Data Flow for List Request
+1. React app â†’ `GET /puppies`
+2. Cloud CDN checks cache â†’ MISS
+3. Cloud Run checks Redis â†’ MISS
+4. Cloud Run queries Cloud SQL
+5. Cloud Run caches in Redis (60s TTL)
+6. Cloud Run returns response
+7. Cloud CDN caches response (60s TTL)
+8. **Future requests served from CDN (fast!)**
+
+---
